@@ -16,7 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from feature_engineering import (
     prepare_data,
@@ -25,6 +25,30 @@ from feature_engineering import (
 )
 from esmm_din_model import ESMM_DIN
 from evaluate import evaluate_esmm, format_metrics
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss - 处理类别不平衡
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    """
+
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        bce = F.binary_cross_entropy(inputs, targets, reduction='none')
+        pt = torch.where(targets == 1, inputs, 1 - inputs)
+        focal_weight = self.alpha * (1 - pt) ** self.gamma
+        loss = focal_weight * bce
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
 
 logging.basicConfig(
     level=logging.INFO,
@@ -184,7 +208,13 @@ def main():
     logger.info(f"Model params: {n_params:,}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
+
+    # Warmup + Cosine Annealing
+    warmup_steps = max(1, args.epochs // 5)
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs - warmup_steps, eta_min=args.min_lr)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
+
     early_stopping = EarlyStopping(patience=args.patience, min_delta=1e-4)
 
     best_auc = 0.0
