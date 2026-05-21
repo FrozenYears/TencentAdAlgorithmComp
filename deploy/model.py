@@ -116,11 +116,13 @@ class ESMM_DIN_DCN(nn.Module):
             self.item_dense_proj = nn.Linear(item_dense_dim, d_model)
 
         self._seq_embs = nn.ModuleDict()
+        self._seq_proj = nn.ModuleDict()
         for domain in self.seq_domains:
             vocab_sizes = seq_vocab_sizes[domain]
             self._seq_embs[domain] = nn.ModuleList([
                 nn.Embedding(vs + 1, emb_dim, padding_idx=0) for vs in vocab_sizes
             ])
+            self._seq_proj[domain] = nn.Linear(emb_dim * len(vocab_sizes), emb_dim)
 
         user_int_dim = emb_dim * len(user_int_feature_specs)
         item_int_dim = emb_dim * len(item_int_feature_specs)
@@ -245,7 +247,8 @@ class ESMM_DIN_DCN(nn.Module):
             parts = []
             for j, emb in enumerate(self._seq_embs[domain]):
                 parts.append(emb(seq_tensor[:, j, :]))
-            seq_emb = torch.cat(parts, dim=-1)
+            seq_emb_raw = torch.cat(parts, dim=-1)
+            seq_emb = self._seq_proj[domain](seq_emb_raw)
 
             attn_out = self.attention_layers[domain](item_query, seq_emb, mask)
             seq_reprs.append(attn_out)
