@@ -1,14 +1,15 @@
 """
-ESMM+DIN+DCN model adapted for official Tencent Angel Platform framework.
+DIN+DCN model for CVR prediction, adapted for Tencent Angel Platform.
 
-Key design decisions:
-- Single-tower CVR prediction (no ESMM multi-task) since label is binary (label_type==2)
+Key features:
 - DIN Target Attention on 4 sequence domains
 - DCN Cross Network for explicit feature interaction
+- emb_skip_threshold: skip ultra-high-cardinality features to save GPU memory
 - Compatible with ModelInput NamedTuple from official framework
 - Implements get_sparse_params()/get_dense_params() for dual optimizer
 """
 
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,7 +27,7 @@ class ModelInput(NamedTuple):
 
 
 class CrossNetwork(nn.Module):
-    def __init__(self, input_dim: int, num_layers: int = 3):
+    def __init__(self, input_dim: int, num_layers: int = 2):
         super().__init__()
         self.cross_layers = nn.ModuleList([
             nn.Linear(input_dim, 1, bias=True) for _ in range(num_layers)
@@ -40,7 +41,7 @@ class CrossNetwork(nn.Module):
 
 
 class DINTargetAttention(nn.Module):
-    def __init__(self, embedding_dim: int, hidden_dim: int = 64):
+    def __init__(self, embedding_dim: int, hidden_dim: int = 32):
         super().__init__()
         self.attention_mlp = nn.Sequential(
             nn.Linear(embedding_dim * 4, hidden_dim),
@@ -60,6 +61,60 @@ class DINTargetAttention(nn.Module):
         return torch.bmm(weights.unsqueeze(1), keys).squeeze(1)
 
 
+def _build_emb_list(
+    feature_specs: List[Tuple[int, int, int]],
+    emb_dim: int,
+    emb_skip_threshold: int,
+) -> Tuple[nn.ModuleList, List[int]]:
+    """Build embedding tables with optional high-cardinality skipping.
+
+    Returns:
+        module_list: Embedding tables (only for non-skipped features).
+        emb_index: Maps feature position -> index in module_list, or -1 if skipped.
+    """
+    embs_raw = []
+    emb_index = []
+    skipped = 0
+    for vs, offset, length in feature_specs:
+        skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
+        if skip:
+            emb_index.append(-1)
+            skipped += 1
+        else:
+            emb_index.append(len(embs_raw))
+            embs_raw.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+    if skipped > 0:
+        logging.info(f"emb_skip_threshold={emb_skip_threshold}: skipped {skipped}/{len(feature_specs)} features")
+    return nn.ModuleList(embs_raw), emb_index
+
+
+def _build_seq_emb_list(
+    vocab_sizes: List[int],
+    emb_dim: int,
+    emb_skip_threshold: int,
+) -> Tuple[nn.ModuleList, List[int]]:
+    """Build sequence embedding tables with optional high-cardinality skipping.
+
+    Returns:
+        module_list: Embedding tables (only for non-skipped features).
+        emb_index: Maps feature position -> index in module_list, or -1 if skipped.
+    """
+    embs_raw = []
+    emb_index = []
+    skipped = 0
+    for vs in vocab_sizes:
+        skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
+        if skip:
+            emb_index.append(-1)
+            skipped += 1
+        else:
+            emb_index.append(len(embs_raw))
+            embs_raw.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+    if skipped > 0:
+        logging.info(f"seq emb_skip_threshold={emb_skip_threshold}: skipped {skipped}/{len(vocab_sizes)} features")
+    return nn.ModuleList(embs_raw), emb_index
+
+
 class ESMM_DIN_DCN(nn.Module):
     def __init__(
         self,
@@ -70,17 +125,17 @@ class ESMM_DIN_DCN(nn.Module):
         seq_vocab_sizes: Dict[str, List[int]],
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
-        d_model: int = 64,
-        emb_dim: int = 32,
+        d_model: int = 32,
+        emb_dim: int = 16,
+        num_cross_layers: int = 2,
+        dropout_rate: float = 0.1,
+        emb_skip_threshold: int = 0,
+        seq_id_threshold: int = 10000,
         num_queries: int = 1,
         num_hyformer_blocks: int = 2,
         num_heads: int = 4,
         seq_encoder_type: str = 'transformer',
         hidden_mult: int = 4,
-        dropout_rate: float = 0.1,
-        num_cross_layers: int = 3,
-        emb_skip_threshold: int = 0,
-        seq_id_threshold: int = 10000,
         action_num: int = 1,
         num_time_buckets: int = 65,
         rank_mixer_mode: str = 'full',
@@ -99,15 +154,15 @@ class ESMM_DIN_DCN(nn.Module):
         self.seq_domains = sorted(seq_vocab_sizes.keys())
         self.user_int_feature_specs = user_int_feature_specs
         self.item_int_feature_specs = item_int_feature_specs
+        self.emb_skip_threshold = emb_skip_threshold
 
-        self.user_embs = nn.ModuleList()
-        for vs, offset, length in user_int_feature_specs:
-            self.user_embs.append(nn.Embedding(vs + 1, emb_dim, padding_idx=0))
+        # ========== User/Item int feature embeddings (with skip) ==========
+        self.user_embs, self.user_emb_index = _build_emb_list(
+            user_int_feature_specs, emb_dim, emb_skip_threshold)
+        self.item_embs, self.item_emb_index = _build_emb_list(
+            item_int_feature_specs, emb_dim, emb_skip_threshold)
 
-        self.item_embs = nn.ModuleList()
-        for vs, offset, length in item_int_feature_specs:
-            self.item_embs.append(nn.Embedding(vs + 1, emb_dim, padding_idx=0))
-
+        # ========== Dense feature projections ==========
         self.has_user_dense = user_dense_dim > 0
         self.has_item_dense = item_dense_dim > 0
         if self.has_user_dense:
@@ -115,15 +170,20 @@ class ESMM_DIN_DCN(nn.Module):
         if self.has_item_dense:
             self.item_dense_proj = nn.Linear(item_dense_dim, d_model)
 
+        # ========== Sequence embeddings (with skip) ==========
         self._seq_embs = nn.ModuleDict()
+        self._seq_emb_index = {}
         self._seq_proj = nn.ModuleDict()
+        self._seq_num_features = {}
         for domain in self.seq_domains:
             vocab_sizes = seq_vocab_sizes[domain]
-            self._seq_embs[domain] = nn.ModuleList([
-                nn.Embedding(vs + 1, emb_dim, padding_idx=0) for vs in vocab_sizes
-            ])
+            embs, idx = _build_seq_emb_list(vocab_sizes, emb_dim, emb_skip_threshold)
+            self._seq_embs[domain] = embs
+            self._seq_emb_index[domain] = idx
+            self._seq_num_features[domain] = len(vocab_sizes)
             self._seq_proj[domain] = nn.Linear(emb_dim * len(vocab_sizes), emb_dim)
 
+        # ========== Feature projection layers ==========
         user_int_dim = emb_dim * len(user_int_feature_specs)
         item_int_dim = emb_dim * len(item_int_feature_specs)
         self.user_proj = nn.Sequential(
@@ -139,11 +199,12 @@ class ESMM_DIN_DCN(nn.Module):
             nn.Dropout(dropout_rate),
         )
 
+        # ========== DIN Attention ==========
         self.item_query_proj = nn.Linear(d_model, emb_dim)
-
+        attn_hidden = max(emb_dim, 32)  # proportional to emb_dim
         self.attention_layers = nn.ModuleDict()
         for domain in self.seq_domains:
-            self.attention_layers[domain] = DINTargetAttention(emb_dim, hidden_dim=64)
+            self.attention_layers[domain] = DINTargetAttention(emb_dim, hidden_dim=attn_hidden)
 
         self.seq_proj = nn.Sequential(
             nn.Linear(emb_dim * len(self.seq_domains), d_model),
@@ -152,6 +213,7 @@ class ESMM_DIN_DCN(nn.Module):
             nn.Dropout(dropout_rate),
         )
 
+        # ========== DCN + DNN Tower ==========
         tower_input = d_model * 3
         self.cross_network = CrossNetwork(tower_input, num_cross_layers)
         self.dnn = nn.Sequential(
@@ -165,6 +227,16 @@ class ESMM_DIN_DCN(nn.Module):
         self.output_layer = nn.Linear(d_model // 2 + tower_input, 1)
 
         self._num_ns = sum(len(g) for g in user_ns_groups) + sum(len(g) for g in item_ns_groups)
+
+        # Log model stats
+        total_params = sum(p.numel() for p in self.parameters())
+        sparse_params = sum(p.numel() for p in self.get_sparse_params())
+        dense_params = sum(p.numel() for p in self.get_dense_params())
+        logging.info(f"ESMM_DIN_DCN: {total_params:,} total params "
+                     f"({sparse_params:,} sparse + {dense_params:,} dense)")
+        logging.info(f"  d_model={d_model}, emb_dim={emb_dim}, "
+                     f"num_cross_layers={num_cross_layers}, "
+                     f"emb_skip_threshold={emb_skip_threshold}")
 
     @property
     def num_ns(self) -> int:
@@ -203,16 +275,37 @@ class ESMM_DIN_DCN(nn.Module):
                 reinit_ptrs.append(emb.weight.data_ptr())
         return reinit_ptrs
 
-    def forward(self, inputs: ModelInput) -> torch.Tensor:
-        user_feats = []
-        for i, (vs, offset, length) in enumerate(self.user_int_feature_specs):
-            feat_slice = inputs.user_int_feats[:, offset:offset+length]
+    def _embed_int_features(
+        self,
+        feature_specs: List[Tuple[int, int, int]],
+        embs: nn.ModuleList,
+        emb_index: List[int],
+        feats: torch.Tensor,
+    ) -> List[torch.Tensor]:
+        """Embed int features, using zero vectors for skipped features."""
+        result = []
+        for i, (vs, offset, length) in enumerate(feature_specs):
+            feat_slice = feats[:, offset:offset + length]
             if length == 1:
                 feat_slice = feat_slice.squeeze(1)
-            emb = self.user_embs[i](feat_slice)
-            if length > 1:
-                emb = emb.mean(dim=1)
-            user_feats.append(emb)
+
+            real_idx = emb_index[i]
+            if real_idx == -1:
+                # Skipped: use zero vector
+                result.append(feat_slice.new_zeros(feat_slice.shape[0], self.emb_dim))
+            else:
+                emb = embs[real_idx]
+                e = emb(feat_slice)
+                if length > 1:
+                    e = e.mean(dim=1)
+                result.append(e)
+        return result
+
+    def forward(self, inputs: ModelInput) -> torch.Tensor:
+        # ========== User features ==========
+        user_feats = self._embed_int_features(
+            self.user_int_feature_specs, self.user_embs, self.user_emb_index,
+            inputs.user_int_feats)
 
         if self.has_user_dense:
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats))
@@ -220,15 +313,10 @@ class ESMM_DIN_DCN(nn.Module):
         else:
             user_repr = self.user_proj(torch.cat(user_feats, dim=-1))
 
-        item_feats = []
-        for i, (vs, offset, length) in enumerate(self.item_int_feature_specs):
-            feat_slice = inputs.item_int_feats[:, offset:offset+length]
-            if length == 1:
-                feat_slice = feat_slice.squeeze(1)
-            emb = self.item_embs[i](feat_slice)
-            if length > 1:
-                emb = emb.mean(dim=1)
-            item_feats.append(emb)
+        # ========== Item features ==========
+        item_feats = self._embed_int_features(
+            self.item_int_feature_specs, self.item_embs, self.item_emb_index,
+            inputs.item_int_feats)
 
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats))
@@ -236,6 +324,7 @@ class ESMM_DIN_DCN(nn.Module):
         else:
             item_repr = self.item_proj(torch.cat(item_feats, dim=-1))
 
+        # ========== DIN Attention on sequences ==========
         item_query = self.item_query_proj(item_repr)
 
         seq_reprs = []
@@ -244,10 +333,18 @@ class ESMM_DIN_DCN(nn.Module):
             seq_ids = seq_tensor[:, 0, :]
             mask = (seq_ids > 0).float()
 
-            parts = []
-            for j, emb in enumerate(self._seq_embs[domain]):
-                parts.append(emb(seq_tensor[:, j, :]))
-            seq_emb_raw = torch.cat(parts, dim=-1)
+            # Embed each sideinfo feature, skip if needed
+            emb_list = []
+            emb_index = self._seq_emb_index[domain]
+            for j in range(self._seq_num_features[domain]):
+                real_idx = emb_index[j] if j < len(emb_index) else -1
+                if real_idx == -1:
+                    B, L = seq_tensor[:, j, :].shape
+                    emb_list.append(seq_tensor.new_zeros(B, L, self.emb_dim))
+                else:
+                    emb_list.append(self._seq_embs[domain][real_idx](seq_tensor[:, j, :]))
+
+            seq_emb_raw = torch.cat(emb_list, dim=-1)
             seq_emb = self._seq_proj[domain](seq_emb_raw)
 
             attn_out = self.attention_layers[domain](item_query, seq_emb, mask)
@@ -255,6 +352,7 @@ class ESMM_DIN_DCN(nn.Module):
 
         seq_repr = self.seq_proj(torch.cat(seq_reprs, dim=-1))
 
+        # ========== DCN + DNN ==========
         combined = torch.cat([user_repr, item_repr, seq_repr], dim=-1)
         cross_out = self.cross_network(combined)
         dnn_out = self.dnn(combined)

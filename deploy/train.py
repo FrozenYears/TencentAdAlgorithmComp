@@ -58,8 +58,11 @@ def parse_args():
     parser.add_argument('--reinit_sparse_after_epoch', type=int, default=1)
     parser.add_argument('--reinit_cardinality_threshold', type=int, default=0)
 
-    parser.add_argument('--emb_skip_threshold', type=int, default=0)
+    parser.add_argument('--emb_skip_threshold', type=int, default=1000000)
     parser.add_argument('--seq_id_threshold', type=int, default=10000)
+
+    parser.add_argument('--use_amp', action='store_true', default=False)
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
 
     _default_ns_groups = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'ns_groups.json')
@@ -143,6 +146,7 @@ def main():
         "emb_dim": args.emb_dim,
         "num_cross_layers": args.num_cross_layers,
         "dropout_rate": args.dropout_rate,
+        "emb_skip_threshold": args.emb_skip_threshold,
     }
 
     model = ESMM_DIN_DCN(**model_args).to(args.device)
@@ -178,6 +182,8 @@ def main():
         schema_path=schema_path,
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         train_config=vars(args),
+        use_amp=args.use_amp,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
 
     trainer.train()

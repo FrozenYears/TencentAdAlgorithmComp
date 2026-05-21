@@ -58,6 +58,8 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        use_amp: bool = False,
+        gradient_accumulation_steps: int = 1,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -107,6 +109,17 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.use_amp: bool = use_amp
+        self.gradient_accumulation_steps: int = max(1, gradient_accumulation_steps)
+
+        self.scaler: Optional[torch.amp.GradScaler] = None
+        if self.use_amp and self.device.startswith('cuda'):
+            self.scaler = torch.amp.GradScaler('cuda')
+            logging.info("AMP enabled: using torch.cuda.amp for mixed precision training")
+
+        if self.gradient_accumulation_steps > 1:
+            logging.info(f"Gradient accumulation: {self.gradient_accumulation_steps} steps "
+                         f"(effective batch_size = {train_loader.batch_size * self.gradient_accumulation_steps})")
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
@@ -287,10 +300,6 @@ class PCVRHyFormerRankingTrainer:
                 total_step, is_best=True, skip_model_file=True)
 
     def train(self) -> None:
-        """Main training loop: iterates over epochs, performs step-level and
-        epoch-level validation, triggers EarlyStopping and the periodic sparse
-        re-initialization strategy.
-        """
         print("Start training (PCVRHyFormer)")
         self.model.train()
         total_step = 0
@@ -300,10 +309,35 @@ class PCVRHyFormerRankingTrainer:
                               dynamic_ncols=True)
             loss_sum = 0.0
 
+            self.dense_optimizer.zero_grad()
+            if self.sparse_optimizer is not None:
+                self.sparse_optimizer.zero_grad()
+
             for step, batch in train_pbar:
                 loss = self._train_step(batch)
                 total_step += 1
                 loss_sum += loss
+
+                # Gradient accumulation: step optimizer every N micro-batches
+                if (step + 1) % self.gradient_accumulation_steps == 0:
+                    if self.scaler is not None:
+                        self.scaler.unscale_(self.dense_optimizer)
+                        if self.sparse_optimizer is not None:
+                            self.scaler.unscale_(self.sparse_optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+                        self.scaler.step(self.dense_optimizer)
+                        if self.sparse_optimizer is not None:
+                            self.scaler.step(self.sparse_optimizer)
+                        self.scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+                        self.dense_optimizer.step()
+                        if self.sparse_optimizer is not None:
+                            self.sparse_optimizer.step()
+
+                    self.dense_optimizer.zero_grad()
+                    if self.sparse_optimizer is not None:
+                        self.sparse_optimizer.zero_grad()
 
                 if self.writer:
                     self.writer.add_scalar('Loss/train', loss, total_step)
@@ -400,32 +434,25 @@ class PCVRHyFormerRankingTrainer:
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> float:
-        """Run a single training step and return the scalar loss value."""
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
 
-        self.dense_optimizer.zero_grad()
-        if self.sparse_optimizer is not None:
-            self.sparse_optimizer.zero_grad()
-
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
 
-        if self.loss_type == 'focal':
-            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+        with torch.amp.autocast('cuda', enabled=self.use_amp):
+            logits = self.model(model_input).squeeze(-1)
+            if self.loss_type == 'focal':
+                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
+            loss = loss / self.gradient_accumulation_steps
+
+        if self.scaler is not None:
+            self.scaler.scale(loss).backward()
         else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
-        loss.backward()
-        # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
-        # with certain tensor shapes in this project.
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+            loss.backward()
 
-        self.dense_optimizer.step()
-        if self.sparse_optimizer is not None:
-            self.sparse_optimizer.step()
-
-        return loss.item()
+        return loss.item() * self.gradient_accumulation_steps
 
     def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:
         """Run validation over ``self.valid_loader`` and return ``(AUC, logloss)``.
