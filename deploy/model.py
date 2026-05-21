@@ -291,8 +291,9 @@ class ESMM_DIN_DCN(nn.Module):
 
             real_idx = emb_index[i]
             if real_idx == -1:
-                # Skipped: use zero vector
-                result.append(feat_slice.new_zeros(feat_slice.shape[0], self.emb_dim))
+                result.append(torch.zeros(
+                    feat_slice.shape[0], self.emb_dim,
+                    dtype=torch.float32, device=feat_slice.device))
             else:
                 emb = embs[real_idx]
                 e = emb(feat_slice)
@@ -340,7 +341,9 @@ class ESMM_DIN_DCN(nn.Module):
                 real_idx = emb_index[j] if j < len(emb_index) else -1
                 if real_idx == -1:
                     B, L = seq_tensor[:, j, :].shape
-                    emb_list.append(seq_tensor.new_zeros(B, L, self.emb_dim))
+                    emb_list.append(torch.zeros(
+                        B, L, self.emb_dim,
+                        dtype=torch.float32, device=seq_tensor.device))
                 else:
                     emb_list.append(self._seq_embs[domain][real_idx](seq_tensor[:, j, :]))
 

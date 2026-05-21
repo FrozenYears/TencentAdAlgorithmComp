@@ -109,17 +109,24 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
-        self.use_amp: bool = use_amp
+        self.use_amp: bool = use_amp and self.device.startswith('cuda')
         self.gradient_accumulation_steps: int = max(1, gradient_accumulation_steps)
+        dataset_batch_size = getattr(getattr(train_loader, 'dataset', None), 'batch_size', None)
+        config_batch_size = train_config.get('batch_size') if train_config else None
+        self.micro_batch_size: Optional[int] = config_batch_size or dataset_batch_size
 
         self.scaler: Optional[torch.amp.GradScaler] = None
-        if self.use_amp and self.device.startswith('cuda'):
+        if self.use_amp:
             self.scaler = torch.amp.GradScaler('cuda')
             logging.info("AMP enabled: using torch.cuda.amp for mixed precision training")
 
         if self.gradient_accumulation_steps > 1:
+            effective_batch_size = None
+            if self.micro_batch_size is not None:
+                effective_batch_size = self.micro_batch_size * self.gradient_accumulation_steps
             logging.info(f"Gradient accumulation: {self.gradient_accumulation_steps} steps "
-                         f"(effective batch_size = {train_loader.batch_size * self.gradient_accumulation_steps})")
+                         f"(micro_batch_size={self.micro_batch_size}, "
+                         f"effective_batch_size={effective_batch_size})")
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
@@ -305,9 +312,10 @@ class PCVRHyFormerRankingTrainer:
         total_step = 0
 
         for epoch in range(1, self.num_epochs + 1):
-            train_pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
+            train_pbar = tqdm(enumerate(self.train_loader), total=self._loader_len(self.train_loader),
                               dynamic_ncols=True)
             loss_sum = 0.0
+            batch_count = 0
 
             self.dense_optimizer.zero_grad()
             if self.sparse_optimizer is not None:
@@ -316,30 +324,13 @@ class PCVRHyFormerRankingTrainer:
             for step, batch in train_pbar:
                 loss = self._train_step(batch)
                 total_step += 1
+                batch_count += 1
                 loss_sum += loss
 
-                # Gradient accumulation: step optimizer every N micro-batches
                 if (step + 1) % self.gradient_accumulation_steps == 0:
-                    if self.scaler is not None:
-                        self.scaler.unscale_(self.dense_optimizer)
-                        if self.sparse_optimizer is not None:
-                            self.scaler.unscale_(self.sparse_optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
-                        self.scaler.step(self.dense_optimizer)
-                        if self.sparse_optimizer is not None:
-                            self.scaler.step(self.sparse_optimizer)
-                        self.scaler.update()
-                    else:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
-                        self.dense_optimizer.step()
-                        if self.sparse_optimizer is not None:
-                            self.sparse_optimizer.step()
+                    self._optimizer_step()
 
-                    self.dense_optimizer.zero_grad()
-                    if self.sparse_optimizer is not None:
-                        self.sparse_optimizer.zero_grad()
-
-                if self.writer:
+                if self.writer and (step + 1) % self.gradient_accumulation_steps == 0:
                     self.writer.add_scalar('Loss/train', loss, total_step)
 
                 train_pbar.set_postfix({"loss": f"{loss:.4f}"})
@@ -363,7 +354,11 @@ class PCVRHyFormerRankingTrainer:
                         logging.info(f"Early stopping at step {total_step}")
                         return
 
-            logging.info(f"Epoch {epoch}, Average Loss: {loss_sum / len(self.train_loader)}")
+            if batch_count > 0 and batch_count % self.gradient_accumulation_steps != 0:
+                self._optimizer_step()
+
+            avg_loss = loss_sum / max(batch_count, 1)
+            logging.info(f"Epoch {epoch}, Average Loss: {avg_loss}")
 
             val_auc, val_logloss = self.evaluate(epoch=epoch)
             self.model.train()
@@ -408,6 +403,36 @@ class PCVRHyFormerRankingTrainer:
                         restored += 1
                 logging.info(f"Rebuilt Adagrad optimizer after epoch {epoch}, "
                              f"restored optimizer state for {restored} low-cardinality params")
+
+    def _optimizer_step(self) -> None:
+        if self.scaler is not None:
+            self.scaler.unscale_(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.scaler.unscale_(self.sparse_optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+            self.scaler.step(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.scaler.step(self.sparse_optimizer)
+            self.scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+            self.dense_optimizer.step()
+            if self.sparse_optimizer is not None:
+                self.sparse_optimizer.step()
+
+        self.dense_optimizer.zero_grad()
+        if self.sparse_optimizer is not None:
+            self.sparse_optimizer.zero_grad()
+
+    @staticmethod
+    def _loader_len(loader: DataLoader) -> Optional[int]:
+        dataset = getattr(loader, 'dataset', None)
+        if dataset is not None:
+            try:
+                return len(dataset)
+            except TypeError:
+                return None
+        return None
 
     def _make_model_input(self, device_batch: Dict[str, Any]) -> ModelInput:
         """Construct a ``ModelInput`` NamedTuple from a device_batch dict."""
@@ -462,10 +487,10 @@ class PCVRHyFormerRankingTrainer:
         """
         print("Start Evaluation (PCVRHyFormer) - validation")
         self.model.eval()
-        if not epoch:
+        if epoch is None:
             epoch = -1
 
-        pbar = tqdm(enumerate(self.valid_loader), total=len(self.valid_loader))
+        pbar = tqdm(enumerate(self.valid_loader), total=self._loader_len(self.valid_loader))
 
         all_logits_list = []
         all_labels_list = []
