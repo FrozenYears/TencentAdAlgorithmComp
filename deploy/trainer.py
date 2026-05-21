@@ -466,11 +466,17 @@ class PCVRHyFormerRankingTrainer:
 
         with torch.amp.autocast('cuda', enabled=self.use_amp):
             logits = self.model(model_input).squeeze(-1)
-            if self.loss_type == 'focal':
-                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
-            else:
-                loss = F.binary_cross_entropy_with_logits(logits, label)
-            loss = loss / self.gradient_accumulation_steps
+
+        logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+        if self.loss_type == 'focal':
+            loss = sigmoid_focal_loss(logits, label.float(), alpha=self.focal_alpha, gamma=self.focal_gamma)
+        else:
+            loss = F.binary_cross_entropy_with_logits(logits, label.float())
+        loss = loss / self.gradient_accumulation_steps
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            logging.warning("NaN/Inf loss detected, skipping this batch")
+            return 0.0
 
         if self.scaler is not None:
             self.scaler.scale(loss).backward()

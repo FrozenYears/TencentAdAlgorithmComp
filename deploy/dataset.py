@@ -500,6 +500,7 @@ class PCVRParquetDataset(IterableDataset):
             use_len = min(raw_len, max_dim)
             padded[i, :use_len] = values[start:start + use_len]
 
+        np.nan_to_num(padded, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
         return padded
 
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:

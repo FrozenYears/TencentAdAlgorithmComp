@@ -188,13 +188,13 @@ class ESMM_DIN_DCN(nn.Module):
         item_int_dim = emb_dim * len(item_int_feature_specs)
         self.user_proj = nn.Sequential(
             nn.Linear(user_int_dim + (d_model if self.has_user_dense else 0), d_model),
-            nn.BatchNorm1d(d_model),
+            nn.LayerNorm(d_model),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
         )
         self.item_proj = nn.Sequential(
             nn.Linear(item_int_dim + (d_model if self.has_item_dense else 0), d_model),
-            nn.BatchNorm1d(d_model),
+            nn.LayerNorm(d_model),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
         )
@@ -208,7 +208,7 @@ class ESMM_DIN_DCN(nn.Module):
 
         self.seq_proj = nn.Sequential(
             nn.Linear(emb_dim * len(self.seq_domains), d_model),
-            nn.BatchNorm1d(d_model),
+            nn.LayerNorm(d_model),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
         )
@@ -218,7 +218,7 @@ class ESMM_DIN_DCN(nn.Module):
         self.cross_network = CrossNetwork(tower_input, num_cross_layers)
         self.dnn = nn.Sequential(
             nn.Linear(tower_input, d_model),
-            nn.BatchNorm1d(d_model),
+            nn.LayerNorm(d_model),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
             nn.Linear(d_model, d_model // 2),
@@ -309,7 +309,8 @@ class ESMM_DIN_DCN(nn.Module):
             inputs.user_int_feats)
 
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats))
+            user_dense = torch.nan_to_num(inputs.user_dense_feats, nan=0.0, posinf=0.0, neginf=0.0)
+            user_dense_tok = F.silu(self.user_dense_proj(user_dense))
             user_repr = self.user_proj(torch.cat(user_feats + [user_dense_tok], dim=-1))
         else:
             user_repr = self.user_proj(torch.cat(user_feats, dim=-1))
@@ -320,7 +321,8 @@ class ESMM_DIN_DCN(nn.Module):
             inputs.item_int_feats)
 
         if self.has_item_dense:
-            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats))
+            item_dense = torch.nan_to_num(inputs.item_dense_feats, nan=0.0, posinf=0.0, neginf=0.0)
+            item_dense_tok = F.silu(self.item_dense_proj(item_dense))
             item_repr = self.item_proj(torch.cat(item_feats + [item_dense_tok], dim=-1))
         else:
             item_repr = self.item_proj(torch.cat(item_feats, dim=-1))
