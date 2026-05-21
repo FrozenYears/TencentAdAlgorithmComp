@@ -4,9 +4,6 @@
 # 安装依赖
 pip install -q scikit-learn tqdm
 
-# 进入代码目录
-cd $EVAL_INFER_PATH 2>/dev/null || cd .
-
 # 运行训练
 python train_v2.py \
     --data_path $TRAIN_DATA_PATH \

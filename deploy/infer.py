@@ -16,8 +16,8 @@ import torch
 # 添加当前目录到路径
 sys.path.insert(0, os.environ.get('EVAL_INFER_PATH', '.'))
 
-from feature_engineering import FeatureProcessor, prepare_data, USER_SCALAR_INT, ITEM_SCALAR_INT, USER_LIST_INT, ITEM_LIST_INT, HASH_BUCKET_SIZE
-from esmm_din_model import ESMM_DIN
+from feature_engineering import FeatureProcessorV2, prepare_data_v2, USER_SCALAR_INT, ITEM_SCALAR_INT, USER_LIST_INT, ITEM_LIST_INT, HASH_BUCKET_SIZE
+from esmm_din_model import ESMM_DIN_V2
 
 
 def main():
@@ -44,8 +44,17 @@ def main():
     
     # 加载模型
     print("\n加载模型...")
+    
+    # 查找最新的checkpoint目录
+    ckpt_dirs = [d for d in os.listdir(model_output_path) if d.startswith('global_step')]
+    if not ckpt_dirs:
+        raise FileNotFoundError(f"No global_step checkpoint found in {model_output_path}")
+    
+    latest_ckpt_dir = sorted(ckpt_dirs)[-1]
+    ckpt_path = os.path.join(model_output_path, latest_ckpt_dir, 'model.pt')
+    
     checkpoint = torch.load(
-        os.path.join(model_output_path, 'best_esmm_din_v2.pt'),
+        ckpt_path,
         map_location='cpu',
         weights_only=False
     )
@@ -79,7 +88,7 @@ def main():
     
     # 特征处理
     print("\n特征处理...")
-    fp = FeatureProcessor(hash_bucket_size=HASH_BUCKET_SIZE)
+    fp = FeatureProcessorV2(hash_bucket_size=HASH_BUCKET_SIZE)
     
     # 使用训练时的统计信息（如果可用）
     train_stats_path = os.path.join(model_output_path, 'feature_stats.pkl')
@@ -93,7 +102,7 @@ def main():
         fp.fit(df)
         print("使用测试数据fit特征统计")
     
-    dataset = prepare_data(df, fp, max_seq_len=50, is_test=True)
+    dataset = prepare_data_v2(df, fp, max_seq_len=50, is_test=True)
     
     # 构建模型
     print("\n构建模型...")
@@ -102,7 +111,7 @@ def main():
     user_list_dims = [fp.scalar_dims.get(c, 1) for c in USER_LIST_INT if c in fp.scalar_dims]
     item_list_dims = [fp.scalar_dims.get(c, 1) for c in ITEM_LIST_INT if c in fp.scalar_dims]
     
-    model = ESMM_DIN(
+    model = ESMM_DIN_V2(
         n_user_scalar_feats=len(user_scalar_dims),
         n_item_scalar_feats=len(item_scalar_dims),
         n_user_list_feats=len(user_list_dims),

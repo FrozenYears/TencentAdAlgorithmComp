@@ -1,13 +1,12 @@
 """
-特征工程模块 - 处理TAAC2026的120列flat parquet格式数据
+特征工程V2 - 增强版特征工程模块
 
-特征分类:
-- 用户标量int特征 (user_int_feats_*): 34个
-- 用户列表int特征 (user_int_feats_*): 11个
-- 用户稠密特征 (user_dense_feats_*): 10个
-- 物品标量int特征 (item_int_feats_*): 13个
-- 物品列表int特征 (item_int_feats_*): 1个
-- 域序列特征 (domain_{a,b,c,d}_seq_*): 45个
+新增优化:
+1. 交叉特征: user_int × item_int 组合
+2. 统计特征: 用户/物品历史CTR/CVR
+3. 时间特征: hour, day_of_week, 时间差
+4. 序列统计: 长度、唯一数、多样性
+5. 所有序列域特征 (不再只用第一个列)
 """
 
 import numpy as np
@@ -15,235 +14,229 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from typing import Dict, List, Tuple, Optional
+from collections import defaultdict
+
+# 导入原始特征定义
+from feature_engineering import (
+    USER_SCALAR_INT, USER_LIST_INT, USER_DENSE,
+    ITEM_SCALAR_INT, ITEM_LIST_INT,
+    DOMAIN_A_SEQ, DOMAIN_B_SEQ, DOMAIN_C_SEQ, DOMAIN_D_SEQ,
+    HASH_BUCKET_SIZE, safe_scalar, safe_list, safe_dense_list, hash_encode,
+    FeatureProcessor
+)
 
 
-# ==================== 特征分类常量 ====================
+# ==================== 新增: 交叉特征定义 ====================
 
-# 用户标量int特征 (低基数直接embedding，高基数hash)
-USER_SCALAR_INT = [
-    'user_int_feats_1', 'user_int_feats_3', 'user_int_feats_4',
-    'user_int_feats_48', 'user_int_feats_49', 'user_int_feats_50',
-    'user_int_feats_51', 'user_int_feats_52', 'user_int_feats_53',
-    'user_int_feats_54', 'user_int_feats_55', 'user_int_feats_56',
-    'user_int_feats_57', 'user_int_feats_58', 'user_int_feats_59',
-    'user_int_feats_82', 'user_int_feats_86', 'user_int_feats_92',
-    'user_int_feats_93', 'user_int_feats_94', 'user_int_feats_95',
-    'user_int_feats_96', 'user_int_feats_97', 'user_int_feats_98',
-    'user_int_feats_99', 'user_int_feats_100', 'user_int_feats_101',
-    'user_int_feats_102', 'user_int_feats_103', 'user_int_feats_104',
-    'user_int_feats_105', 'user_int_feats_106', 'user_int_feats_107',
-    'user_int_feats_108', 'user_int_feats_109',
-]
+# 用于交叉的用户特征 (低基数, 适合做交叉)
+CROSS_USER_FEATS = ['user_int_feats_1', 'user_int_feats_82']
 
-# 用户列表int特征
-USER_LIST_INT = [
-    'user_int_feats_15', 'user_int_feats_60', 'user_int_feats_62',
-    'user_int_feats_63', 'user_int_feats_64', 'user_int_feats_65',
-    'user_int_feats_66', 'user_int_feats_80',
-    'user_int_feats_89', 'user_int_feats_90', 'user_int_feats_91',
-]
+# 用于交叉的物品特征 (低基数)
+CROSS_ITEM_FEATS = ['item_int_feats_5', 'item_int_feats_6', 'item_int_feats_7']
 
-# 用户稠密特征
-USER_DENSE = [
-    'user_dense_feats_61', 'user_dense_feats_62', 'user_dense_feats_63',
-    'user_dense_feats_64', 'user_dense_feats_65', 'user_dense_feats_66',
-    'user_dense_feats_87', 'user_dense_feats_89', 'user_dense_feats_90',
-    'user_dense_feats_91',
-]
-
-# 物品标量int特征
-ITEM_SCALAR_INT = [
-    'item_int_feats_5', 'item_int_feats_6', 'item_int_feats_7',
-    'item_int_feats_8', 'item_int_feats_9', 'item_int_feats_10',
-    'item_int_feats_12', 'item_int_feats_13', 'item_int_feats_16',
-    'item_int_feats_81', 'item_int_feats_83', 'item_int_feats_84',
-    'item_int_feats_85',
-]
-
-# 物品列表int特征
-ITEM_LIST_INT = ['item_int_feats_11']
-
-# 域序列特征分组
-DOMAIN_A_SEQ = [f'domain_a_seq_{i}' for i in [38,39,40,41,42,43,44,45,46]]
-DOMAIN_B_SEQ = [f'domain_b_seq_{i}' for i in [67,68,69,70,71,72,73,74,75,76,77,78,79,88]]
-DOMAIN_C_SEQ = [f'domain_c_seq_{i}' for i in [27,28,29,30,31,32,33,34,35,36,37,47]]
-DOMAIN_D_SEQ = [f'domain_d_seq_{i}' for i in [17,18,19,20,21,22,23,24,25,26]]
-
-# Hash桶大小 (高基数特征)
-HASH_BUCKET_SIZE = 10000
+# 交叉特征hash桶大小
+CROSS_HASH_BUCKET = 5000
 
 
-def safe_scalar(val, default=0):
-    """安全提取标量值，处理NaN和None"""
-    if val is None:
-        return default
-    if isinstance(val, (list, np.ndarray)):
-        return default
-    try:
-        if np.isnan(val):
-            return default
-    except (TypeError, ValueError):
-        pass
-    return int(val)
+# ==================== 新增: 统计特征计算 ====================
 
-
-def safe_list(val, max_len=10):
-    """安全提取列表值，截断到max_len"""
-    if val is None:
-        return []
-    if isinstance(val, (list, np.ndarray)):
-        return list(val[:max_len])
-    return []
-
-
-def safe_dense_list(val, dim=None):
-    """安全提取稠密向量, 保证返回恰好dim个元素"""
-    if val is None:
-        return [0.0] * dim if dim else []
-    if isinstance(val, (list, np.ndarray)):
-        result = list(val)
-        if dim is not None:
-            if len(result) >= dim:
-                return result[:dim]
-            else:
-                return result + [0.0] * (dim - len(result))
-        return result
-    return [0.0] * dim if dim else []
-
-
-# ==================== 特征统计和编码 ====================
-
-class FeatureProcessor:
-    """特征处理器：统计特征基数、建立映射、处理hash"""
-
-    def __init__(self, hash_bucket_size=HASH_BUCKET_SIZE):
-        self.hash_bucket_size = hash_bucket_size
-        # 标量特征的唯一值映射 {col_name: {val: encoded_id}}
-        self.scalar_mappings: Dict[str, Optional[Dict[int, int]]] = {}
-        # 特征的最大编码ID (用于embedding大小)
-        self.scalar_dims: Dict[str, int] = {}
-        # 列表特征的最大长度
-        self.list_max_lens: Dict[str, int] = {}
-        # 稠密特征的维度
-        self.dense_dims: Dict[str, int] = {}
-        # 序列特征的最大长度
-        self.seq_max_len = 50
-        # 是否已fit
-        self.is_fitted = False
-
-    def fit(self, df: pd.DataFrame):
-        """从训练数据中统计特征信息"""
-        # 处理用户标量特征
-        for col in USER_SCALAR_INT:
-            if col not in df.columns:
-                continue
-            vals = df[col].apply(safe_scalar).astype(int)
-            unique_vals = sorted(vals.unique())
-            if len(unique_vals) > self.hash_bucket_size:
-                # 高基数特征用hash
-                self.scalar_mappings[col] = None  # None表示用hash
-                self.scalar_dims[col] = self.hash_bucket_size + 1  # hash返回[1, bucket_size], 需要+1
-            else:
-                mapping = {v: i + 1 for i, v in enumerate(unique_vals)}  # 0留给padding
-                self.scalar_mappings[col] = mapping
-                self.scalar_dims[col] = len(mapping) + 1
-
-        # 处理物品标量特征
-        for col in ITEM_SCALAR_INT:
-            if col not in df.columns:
-                continue
-            vals = df[col].apply(safe_scalar).astype(int)
-            unique_vals = sorted(vals.unique())
-            if len(unique_vals) > self.hash_bucket_size:
-                self.scalar_mappings[col] = None
-                self.scalar_dims[col] = self.hash_bucket_size + 1
-            else:
-                mapping = {v: i + 1 for i, v in enumerate(unique_vals)}
-                self.scalar_mappings[col] = mapping
-                self.scalar_dims[col] = len(mapping) + 1
-
-        # 处理列表特征: 最大长度 + 建立值映射(同标量特征逻辑)
-        for col in USER_LIST_INT + ITEM_LIST_INT:
-            if col not in df.columns:
-                continue
-            max_len = df[col].apply(lambda x: len(safe_list(x, 100))).max()
-            self.list_max_lens[col] = min(int(max_len), 20)
-            all_vals = []
-            for v in df[col].dropna():
-                if isinstance(v, (list, np.ndarray)):
-                    all_vals.extend([safe_scalar(x) for x in v])
-            unique_vals = sorted(set(all_vals)) if all_vals else [0]
-            if len(unique_vals) > self.hash_bucket_size:
-                self.scalar_mappings[col] = None
-                self.scalar_dims[col] = self.hash_bucket_size + 1
-            else:
-                mapping = {v: i + 1 for i, v in enumerate(unique_vals)}
-                self.scalar_mappings[col] = mapping
-                self.scalar_dims[col] = len(mapping) + 1
-
-        # 处理稠密特征维度
-        for col in USER_DENSE:
-            if col not in df.columns:
-                continue
-            sample = df[col].iloc[0]
-            if isinstance(sample, (list, np.ndarray)):
-                self.dense_dims[col] = len(sample)
-            else:
-                self.dense_dims[col] = 1
-
-        self.is_fitted = True
-        print(f"[FeatureProcessor] 特征统计完成: "
-              f"{len(self.scalar_dims)}个标量特征, "
-              f"{len(self.list_max_lens)}个列表特征, "
-              f"{len(self.dense_dims)}个稠密特征")
-
-    def encode_scalar(self, col: str, val: int) -> int:
-        """编码标量特征值"""
-        mapping = self.scalar_mappings.get(col)
-        if mapping is None:
-            # Hash编码
-            return hash(val) % self.hash_bucket_size + 1
-        return mapping.get(val, 0)  # 0是unknown/padding
-
-    def encode_list(self, col: str, vals: list, max_len: int = None) -> List[int]:
-        """编码列表特征值, 对每个元素应用encode_scalar(含hash), padding到固定长度"""
-        if max_len is None:
-            max_len = self.list_max_lens.get(col, 10)
-        processed = []
-        for v in vals[:max_len]:
-            processed.append(self.encode_scalar(col, safe_scalar(v)))
-        while len(processed) < max_len:
-            processed.append(0)
-        return processed
-
-
-def hash_encode(val: int, bucket_size: int = HASH_BUCKET_SIZE) -> int:
-    """简单hash编码"""
-    return hash(val) % bucket_size + 1
-
-
-# ==================== 数据集 ====================
-
-class TAACDataset(Dataset):
+def compute_statistical_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    TAAC2026数据集
+    计算统计特征: 用户/物品的历史CTR、CVR
 
-    处理120列flat parquet格式，输出:
-    - user_scalar: [batch, n_user_scalar]
-    - user_list: [batch, n_user_list, max_list_len]
-    - user_dense: [batch, total_dense_dim]
-    - item_scalar: [batch, n_item_scalar]
-    - item_list: [batch, n_item_list, max_list_len]
-    - seq_a/b/c/d: [batch, max_seq_len, n_seq_cols] (每域的序列特征)
-    - seq_mask: [batch, max_seq_len]
-    - ctr_label: [batch] (0/1: 是否点击)
-    - cvr_label: [batch] (0/1: 是否转化, 仅对点击样本有意义)
+    Args:
+        df: 包含user_id, item_id, label_type的DataFrame
+
+    Returns:
+        添加了统计特征的DataFrame
     """
+    df = df.copy()
+
+    # 用户历史统计
+    user_stats = df.groupby('user_id').agg(
+        user_hist_count=('label_type', 'count'),
+        user_hist_click=('label_type', lambda x: (x >= 1).sum()),
+        user_hist_convert=('label_type', lambda x: (x == 2).sum()),
+    ).reset_index()
+    user_stats['user_hist_ctr'] = user_stats['user_hist_click'] / user_stats['user_hist_count'].clip(lower=1)
+    user_stats['user_hist_cvr'] = user_stats['user_hist_convert'] / user_stats['user_hist_click'].clip(lower=1)
+
+    # 物品历史统计
+    item_stats = df.groupby('item_id').agg(
+        item_hist_count=('label_type', 'count'),
+        item_hist_click=('label_type', lambda x: (x >= 1).sum()),
+        item_hist_convert=('label_type', lambda x: (x == 2).sum()),
+    ).reset_index()
+    item_stats['item_hist_ctr'] = item_stats['item_hist_click'] / item_stats['item_hist_count'].clip(lower=1)
+    item_stats['item_hist_cvr'] = item_stats['item_hist_convert'] / item_stats['item_hist_click'].clip(lower=1)
+
+    # 合并统计特征
+    df = df.merge(user_stats, on='user_id', how='left')
+    df = df.merge(item_stats, on='item_id', how='left')
+
+    # 填充缺失值
+    for col in ['user_hist_ctr', 'user_hist_cvr', 'item_hist_ctr', 'item_hist_cvr']:
+        df[col] = df[col].fillna(0.0)
+    for col in ['user_hist_count', 'user_hist_click', 'user_hist_convert',
+                 'item_hist_count', 'item_hist_click', 'item_hist_convert']:
+        df[col] = df[col].fillna(0).astype(np.float32)
+
+    return df
+
+
+# ==================== 新增: 时间特征 ====================
+
+def compute_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    计算时间特征: hour, day_of_week, 时间差
+
+    Args:
+        df: 包含timestamp, label_time的DataFrame
+
+    Returns:
+        添加了时间特征的DataFrame
+    """
+    df = df.copy()
+
+    if 'timestamp' in df.columns:
+        # 转换为datetime
+        ts = pd.to_datetime(df['timestamp'], unit='s')
+        df['time_hour'] = ts.dt.hour.astype(np.float32)
+        df['time_day_of_week'] = ts.dt.dayofweek.astype(np.float32)
+        df['time_is_weekend'] = (ts.dt.dayofweek >= 5).astype(np.float32)
+
+        # 时间差 (label_time - timestamp), 单位秒
+        if 'label_time' in df.columns:
+            df['time_to_label'] = (df['label_time'] - df['timestamp']).clip(lower=0).astype(np.float32)
+        else:
+            df['time_to_label'] = 0.0
+    else:
+        df['time_hour'] = 0.0
+        df['time_day_of_week'] = 0.0
+        df['time_is_weekend'] = 0.0
+        df['time_to_label'] = 0.0
+
+    return df
+
+
+# ==================== 新增: 序列统计特征 ====================
+
+def compute_sequence_statistics(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    计算序列统计特征: 长度、唯一数、多样性
+
+    Args:
+        df: 包含domain序列的DataFrame
+
+    Returns:
+        添加了序列统计特征的DataFrame
+    """
+    df = df.copy()
+
+    domains = {
+        'a': DOMAIN_A_SEQ[0],
+        'b': DOMAIN_B_SEQ[0],
+        'c': DOMAIN_C_SEQ[0],
+        'd': DOMAIN_D_SEQ[0],
+    }
+
+    for domain_name, col in domains.items():
+        if col not in df.columns:
+            df[f'seq_{domain_name}_len'] = 0.0
+            df[f'seq_{domain_name}_unique'] = 0.0
+            df[f'seq_{domain_name}_diversity'] = 0.0
+            continue
+
+        lengths = []
+        uniques = []
+        diversities = []
+        for vals in df[col]:
+            if isinstance(vals, (list, np.ndarray)):
+                non_zero = [v for v in vals if v != 0]
+                seq_len = len(non_zero)
+                seq_unique = len(set(non_zero))
+                diversity = seq_unique / max(seq_len, 1)
+            else:
+                seq_len = 0
+                seq_unique = 0
+                diversity = 0.0
+            lengths.append(seq_len)
+            uniques.append(seq_unique)
+            diversities.append(diversity)
+
+        df[f'seq_{domain_name}_len'] = np.array(lengths, dtype=np.float32)
+        df[f'seq_{domain_name}_unique'] = np.array(uniques, dtype=np.float32)
+        df[f'seq_{domain_name}_diversity'] = np.array(diversities, dtype=np.float32)
+
+    return df
+
+
+# ==================== 新增: 交叉特征编码 ====================
+
+def compute_cross_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    计算交叉特征: user_int × item_int 组合
+
+    Args:
+        df: 包含用户和物品特征的DataFrame
+
+    Returns:
+        添加了交叉特征的DataFrame
+    """
+    df = df.copy()
+
+    for u_feat in CROSS_USER_FEATS:
+        for i_feat in CROSS_ITEM_FEATS:
+            if u_feat in df.columns and i_feat in df.columns:
+                # 组合特征: hash(u_val * 1000000 + i_val)
+                u_vals = df[u_feat].fillna(0).astype(int)
+                i_vals = df[i_feat].fillna(0).astype(int)
+                cross_vals = u_vals * 1000000 + i_vals
+                df[f'cross_{u_feat}_{i_feat}'] = cross_vals
+
+    return df
+
+
+# ==================== 增强版数据集 ====================
+
+class TAACDatasetV2(Dataset):
+    """
+    TAAC2026数据集V2 - 增强版
+
+    新增:
+    - 统计特征 (用户/物品历史CTR/CVR)
+    - 时间特征 (hour, day_of_week, is_weekend, time_to_label)
+    - 序列统计 (长度、唯一数、多样性)
+    - 交叉特征 (user_int × item_int)
+    - 所有序列域特征
+    """
+
+    # 统计特征列
+    STAT_FEATS = [
+        'user_hist_count', 'user_hist_click', 'user_hist_convert',
+        'user_hist_ctr', 'user_hist_cvr',
+        'item_hist_count', 'item_hist_click', 'item_hist_convert',
+        'item_hist_ctr', 'item_hist_cvr',
+    ]
+
+    # 时间特征列
+    TIME_FEATS = ['time_hour', 'time_day_of_week', 'time_is_weekend', 'time_to_label']
+
+    # 序列统计特征列
+    SEQ_STAT_FEATS = []
+    for d in ['a', 'b', 'c', 'd']:
+        SEQ_STAT_FEATS.extend([f'seq_{d}_len', f'seq_{d}_unique', f'seq_{d}_diversity'])
+
+    # 交叉特征列
+    CROSS_FEATS = []
+    for u_feat in CROSS_USER_FEATS:
+        for i_feat in CROSS_ITEM_FEATS:
+            CROSS_FEATS.append(f'cross_{u_feat}_{i_feat}')
 
     def __init__(
         self,
         df: pd.DataFrame,
-        feature_processor: FeatureProcessor,
+        feature_processor: 'FeatureProcessorV2',
         max_seq_len: int = 50,
     ):
         self.df = df.reset_index(drop=True)
@@ -310,13 +303,38 @@ class TAACDataset(Dataset):
                     self.user_dense_feats[i, offset:offset+dim] = vals[:dim]
                 offset += dim
 
-        # 序列特征 (使用item_id列作为序列, 取每个domain的第一个seq列)
+        # 统计特征
+        self.stat_feats = np.zeros((self.n_samples, len(self.STAT_FEATS)), dtype=np.float32)
+        for j, col in enumerate(self.STAT_FEATS):
+            if col in df.columns:
+                self.stat_feats[:, j] = df[col].fillna(0).values.astype(np.float32)
+
+        # 时间特征
+        self.time_feats = np.zeros((self.n_samples, len(self.TIME_FEATS)), dtype=np.float32)
+        for j, col in enumerate(self.TIME_FEATS):
+            if col in df.columns:
+                self.time_feats[:, j] = df[col].fillna(0).values.astype(np.float32)
+
+        # 序列统计特征
+        self.seq_stat_feats = np.zeros((self.n_samples, len(self.SEQ_STAT_FEATS)), dtype=np.float32)
+        for j, col in enumerate(self.SEQ_STAT_FEATS):
+            if col in df.columns:
+                self.seq_stat_feats[:, j] = df[col].fillna(0).values.astype(np.float32)
+
+        # 交叉特征
+        n_cross = len(self.CROSS_FEATS)
+        self.cross_feats = np.zeros((self.n_samples, n_cross), dtype=np.int64)
+        for j, col in enumerate(self.CROSS_FEATS):
+            if col in df.columns:
+                for i in range(self.n_samples):
+                    val = int(df[col].iloc[i]) if pd.notna(df[col].iloc[i]) else 0
+                    self.cross_feats[i, j] = hash_encode(val, CROSS_HASH_BUCKET)
+
+        # 序列特征 (使用所有序列列, 不只是第一个)
         self._process_domain_sequences(df)
 
     def _process_domain_sequences(self, df: pd.DataFrame):
-        """处理域序列特征: 每个domain取item_id序列，截断/padding到max_seq_len"""
-        # domain_a的第一个列(seq_38)是item_id
-        # 各domain的序列长度不同，统一截断到max_seq_len
+        """处理域序列特征: 使用所有序列列, 截断/padding到max_seq_len"""
         domains = {
             'a': DOMAIN_A_SEQ,
             'b': DOMAIN_B_SEQ,
@@ -326,7 +344,7 @@ class TAACDataset(Dataset):
 
         self.domain_seqs = {}
         for domain_name, cols in domains.items():
-            # 只用第一个列(item_id)作为序列
+            # 使用所有列, 取第一个非零值作为序列
             first_col = cols[0]
             if first_col not in df.columns:
                 self.domain_seqs[domain_name] = np.zeros((self.n_samples, self.max_seq_len), dtype=np.int64)
@@ -334,12 +352,21 @@ class TAACDataset(Dataset):
 
             seq_data = np.zeros((self.n_samples, self.max_seq_len), dtype=np.int64)
             for i in range(self.n_samples):
-                vals = safe_list(df[first_col].iloc[i], self.max_seq_len)
-                for j, v in enumerate(vals[:self.max_seq_len]):
-                    seq_data[i, j] = hash_encode(int(v)) if v else 0
+                # 收集该domain所有列的值
+                all_vals = []
+                for col in cols:
+                    if col in df.columns:
+                        vals = safe_list(df[col].iloc[i], self.max_seq_len)
+                        all_vals.extend([int(v) for v in vals if v != 0])
+
+                # 去重并截断
+                unique_vals = list(dict.fromkeys(all_vals))[:self.max_seq_len]
+                for j, v in enumerate(unique_vals):
+                    seq_data[i, j] = hash_encode(v) if v else 0
+
             self.domain_seqs[domain_name] = seq_data
 
-        # 序列mask (非零位置为1)
+        # 序列mask
         any_seq = None
         for domain_name, seq_data in self.domain_seqs.items():
             if any_seq is None:
@@ -358,6 +385,10 @@ class TAACDataset(Dataset):
             'user_dense': torch.tensor(self.user_dense_feats[idx], dtype=torch.float32),
             'item_scalar': torch.tensor(self.item_scalar_feats[idx], dtype=torch.long),
             'item_list': torch.tensor(self.item_list_feats[idx], dtype=torch.long),
+            'stat_feats': torch.tensor(self.stat_feats[idx], dtype=torch.float32),
+            'time_feats': torch.tensor(self.time_feats[idx], dtype=torch.float32),
+            'seq_stat_feats': torch.tensor(self.seq_stat_feats[idx], dtype=torch.float32),
+            'cross_feats': torch.tensor(self.cross_feats[idx], dtype=torch.long),
             'seq_a': torch.tensor(self.domain_seqs['a'][idx], dtype=torch.long),
             'seq_b': torch.tensor(self.domain_seqs['b'][idx], dtype=torch.long),
             'seq_c': torch.tensor(self.domain_seqs['c'][idx], dtype=torch.long),
@@ -368,24 +399,63 @@ class TAACDataset(Dataset):
         }
 
 
+# ==================== 增强版特征处理器 ====================
+
+class FeatureProcessorV2(FeatureProcessor):
+    """特征处理器V2: 继承原始处理器, 添加新特征支持"""
+
+    def __init__(self, hash_bucket_size=HASH_BUCKET_SIZE):
+        super().__init__(hash_bucket_size)
+        # 交叉特征维度
+        self.cross_dims: Dict[str, int] = {}
+
+    def fit(self, df: pd.DataFrame):
+        """从训练数据中统计特征信息"""
+        # 先调用父类fit
+        super().fit(df)
+
+        # 统计交叉特征维度
+        for col in TAACDatasetV2.CROSS_FEATS:
+            if col in df.columns:
+                self.cross_dims[col] = CROSS_HASH_BUCKET + 1
+
+        print(f"[FeatureProcessorV2] 新增: {len(self.cross_dims)}个交叉特征")
+
+
 # ==================== 工具函数 ====================
 
-def prepare_data(
+def prepare_data_v2(
     data_path: str,
     test_size: float = 0.2,
     random_state: int = 42,
     max_seq_len: int = 50,
-) -> Tuple[TAACDataset, TAACDataset, FeatureProcessor]:
+) -> Tuple[TAACDatasetV2, TAACDatasetV2, FeatureProcessorV2]:
     """
-    加载数据并准备训练/验证集
+    加载数据并准备训练/验证集 (V2版本)
 
     Returns:
         train_dataset, val_dataset, feature_processor
     """
-    print(f"[数据] 加载 {data_path}...")
+    print(f"[数据V2] 加载 {data_path}...")
     df = pd.read_parquet(data_path)
-    print(f"[数据] Shape: {df.shape}")
-    print(f"[数据] 标签分布:\n{df['label_type'].value_counts().sort_index()}")
+    print(f"[数据V2] Shape: {df.shape}")
+    print(f"[数据V2] 标签分布:\n{df['label_type'].value_counts().sort_index()}")
+
+    # 计算统计特征 (需要在划分前, 因为需要全局统计)
+    print("[数据V2] 计算统计特征...")
+    df = compute_statistical_features(df)
+
+    # 计算时间特征
+    print("[数据V2] 计算时间特征...")
+    df = compute_time_features(df)
+
+    # 计算序列统计特征
+    print("[数据V2] 计算序列统计特征...")
+    df = compute_sequence_statistics(df)
+
+    # 计算交叉特征
+    print("[数据V2] 计算交叉特征...")
+    df = compute_cross_features(df)
 
     # 时间排序划分 (避免数据泄漏)
     if 'timestamp' in df.columns:
@@ -401,14 +471,14 @@ def prepare_data(
         train_df = train_df.reset_index(drop=True)
         val_df = val_df.reset_index(drop=True)
 
-    print(f"[数据] 训练集: {len(train_df)}, 验证集: {len(val_df)}")
+    print(f"[数据V2] 训练集: {len(train_df)}, 验证集: {len(val_df)}")
 
     # 特征处理器 (只在训练集上fit)
-    fp = FeatureProcessor(hash_bucket_size=HASH_BUCKET_SIZE)
+    fp = FeatureProcessorV2(hash_bucket_size=HASH_BUCKET_SIZE)
     fp.fit(train_df)
 
     # 创建数据集
-    train_dataset = TAACDataset(train_df, fp, max_seq_len=max_seq_len)
-    val_dataset = TAACDataset(val_df, fp, max_seq_len=max_seq_len)
+    train_dataset = TAACDatasetV2(train_df, fp, max_seq_len=max_seq_len)
+    val_dataset = TAACDatasetV2(val_df, fp, max_seq_len=max_seq_len)
 
     return train_dataset, val_dataset, fp

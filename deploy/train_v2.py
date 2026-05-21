@@ -383,7 +383,8 @@ def main():
 
         if ctcvr_auc > best_auc:
             best_auc = ctcvr_auc
-            save_path = os.path.join(args.save_dir, 'best_esmm_din_v2.pt')
+            save_path = os.path.join(args.save_dir, f'global_step{epoch}.best_auc={best_auc:.4f}')
+            os.makedirs(save_path, exist_ok=True)
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -391,7 +392,7 @@ def main():
                 'best_auc': best_auc,
                 'metrics': val_metrics,
                 'args': vars(args),
-            }, save_path)
+            }, os.path.join(save_path, 'model.pt'))
             logger.info(f"  -> Saved best model: CTCVR AUC={best_auc:.4f}")
 
         early_stopping(ctcvr_auc)
